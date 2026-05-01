@@ -1,27 +1,49 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from datetime import datetime, timezone, timedelta
-from hashlib import sha256
-import os, hmac, time
 from functools import wraps
 from flask_cors import CORS
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import secrets
-import string
+import os, time
+import jwt
+import bcrypt
+
+#use to create hash password
+#print(bcrypt.hashpw("136741090603".encode(), bcrypt.gensalt()).decode())
+
+SECRET_KEY = os.getenv("JWT_SECRET")
+if not SECRET_KEY:
+    raise Exception("JWT_SECRET is missing")
 
 app = Flask(__name__)
 CORS(app)
 
 # =========================
-# CONFIG
+# RBAC
 # =========================
+def roles_required(*roles):
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
 
-ADMIN_KEY = os.getenv("ADMIN_KEY", "secret123")
-ADMIN_HASH = sha256(ADMIN_KEY.encode()).hexdigest()
+            # FIX: prevent crash if role missing
+            if not hasattr(g, "role"):
+                return jsonify({"error": "unauthorized"}), 403
 
+            if g.role not in roles:
+                return jsonify({"error": "forbidden"}), 403
+
+            return f(*args, **kwargs)
+
+        return wrapper
+    return decorator
+
+# =========================
+# DB
+# =========================
 def db():
     url = os.getenv("DATABASE_URL")
     if not url:
@@ -31,7 +53,6 @@ def db():
 # =========================
 # RATE LIMIT
 # =========================
-
 RATE_LIMIT = {}
 RATE_WINDOW = 10
 RATE_MAX = 20
@@ -53,40 +74,84 @@ def rate_limiter():
 # =========================
 # HELPERS
 # =========================
-
 def json_error(msg, code=400):
     return jsonify({"error": msg}), code
 
-def require_auth():
-    key = request.headers.get("Authorization")
-    if not key:
-        return False
-    return hmac.compare_digest(
-        sha256(key.encode()).hexdigest(),
-        ADMIN_HASH
-    )
-
-def protected(f):
+# =========================
+# JWT MIDDLEWARE
+# =========================
+def token_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
-        if not rate_limiter():
-            return json_error("rate limit exceeded", 429)
-        if not require_auth():
-            return json_error("unauthorized", 403)
+        auth = request.headers.get("Authorization")
+
+        if not auth:
+            return jsonify({"error": "missing token"}), 403
+
+        # FIX: safer parsing
+        token = auth.replace("Bearer ", "").strip()
+
+        try:
+            decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            g.user = decoded["user"]
+            g.role = decoded["role"]
+            g.admin_id = decoded["admin_id"]
+
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "token expired"}), 403
+
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "invalid token"}), 403
+
         return f(*args, **kwargs)
+
     return wrapper
 
-def generate_key():
-    return "-".join(
-        ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
-        for _ in range(3)
-    )
+# =========================
+# LOGIN
+# =========================
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json(silent=True) or {}
+
+    username = data.get("username")
+    password = data.get("password")
+
+    conn = db()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+
+    c.execute("SELECT * FROM admins WHERE username=%s", (username,))
+    admin = c.fetchone()
+
+    conn.close()
+
+    if not admin:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    # 🔐 bcrypt check (IMPORTANT)
+    if not bcrypt.checkpw(password.encode(), admin["password_hash"].encode()):
+        return jsonify({"error": "invalid credentials"}), 401
+
+    payload = {
+        "user": username,
+        "role": admin["role"],
+        "admin_id": admin["id"],
+        "exp": datetime.now(timezone.utc) + timedelta(hours=2)
+    }
+
+    token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+    return jsonify({
+        "message": "login successful",
+        "token": token
+    })
 
 # =========================
 # CREATE LICENSE
 # =========================
 @app.route("/add", methods=["POST"])
-@protected
+@token_required
+@roles_required("admin", "moderator")
 def add_license():
     data = request.get_json(silent=True) or {}
 
@@ -99,14 +164,12 @@ def add_license():
     except:
         return json_error("invalid days")
 
-    # checks for 0 or negative days
     if days <= 0:
-        return json_error("days must not be 0")
+        return json_error("days must be greater than 0")
 
     conn = db()
     c = conn.cursor(cursor_factory=RealDictCursor)
 
-    # duplicate check
     c.execute("SELECT 1 FROM users WHERE license_key=%s", (license_key,))
     if c.fetchone():
         conn.close()
@@ -115,9 +178,9 @@ def add_license():
     expires = datetime.now(timezone.utc) + timedelta(days=days)
 
     c.execute("""
-        INSERT INTO users (license_key, status, expires, banned, bound_device)
-        VALUES (%s, %s, %s, %s, %s)
-    """, (license_key, "premium", expires, False, None))
+        INSERT INTO users (license_key, status, expires, banned, bound_device, admin_id)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, (license_key, "premium", expires, False, None, g.admin_id))
 
     conn.commit()
     conn.close()
@@ -129,10 +192,13 @@ def add_license():
     })
 
 # =========================
-# VALIDATE + BIND DEVICE
+# VALIDATE (PUBLIC)
 # =========================
 @app.route("/validate", methods=["POST"])
 def validate():
+    if not rate_limiter():
+        return jsonify({"status": "rate_limited"}), 429
+
     data = request.get_json(silent=True) or {}
 
     license_key = data.get("license_key")
@@ -166,7 +232,6 @@ def validate():
         conn.close()
         return jsonify({"status": "expired"})
 
-    # FIRST TIME ACTIVATION
     if not user["bound_device"]:
         c.execute("""
             UPDATE users
@@ -184,7 +249,6 @@ def validate():
             "bound_device": device_id
         })
 
-    # DEVICE CHECK
     if user["bound_device"] != device_id:
         conn.close()
         return jsonify({"status": "device_mismatch"})
@@ -201,28 +265,41 @@ def validate():
 # BAN
 # =========================
 @app.route("/ban", methods=["POST"])
-@protected
+@token_required
+@roles_required("admin", "moderator")
 def ban():
     data = request.get_json() or {}
     key = data.get("license_key")
 
+    if not key:
+        return json_error("license_key required")
+
     conn = db()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor)
 
-    # checks current status
-    c.execute("SELECT banned FROM  users WHERE license_key=%s", (key,))
-    result = c.fetchone()
+    # check first
+    c.execute("""
+        SELECT banned FROM users
+        WHERE license_key=%s AND admin_id=%s
+    """, (key, g.admin_id))
 
-    if not result:
+    row = c.fetchone()
+
+    if not row:
         conn.close()
-        return  jsonify({"error": "put a key first"}), 404
+        return json_error("not found")
 
-    if result[0]: # if already banned
+    if row["banned"]:
         conn.close()
-        return jsonify({"error": "already banned"}), 404
+        return json_error("already banned")
 
-    # only update if checks are negative
-    c.execute("UPDATE users SET banned=TRUE WHERE license_key=%s", (key,))
+    # update
+    c.execute("""
+        UPDATE users
+        SET banned=TRUE
+        WHERE license_key=%s AND admin_id=%s
+    """, (key, g.admin_id))
+
     conn.commit()
     conn.close()
 
@@ -232,28 +309,39 @@ def ban():
 # UNBAN
 # =========================
 @app.route("/unban", methods=["POST"])
-@protected
+@token_required
+@roles_required("admin", "moderator")
 def unban():
     data = request.get_json() or {}
     key = data.get("license_key")
 
+    if not key:
+        return json_error("license_key required")
+
     conn = db()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor)
 
-    # checks current status
-    c.execute("SELECT banned FROM users WHERE license_key=%s", (key,))
-    result = c.fetchone()
+    c.execute("""
+        SELECT banned FROM users
+        WHERE license_key=%s AND admin_id=%s
+    """, (key, g.admin_id))
 
-    if not result:
+    row = c.fetchone()
+
+    if not row:
         conn.close()
-        return jsonify({"error": "put a key first"}), 404
+        return json_error("not found")
 
-    if not result[0]: # check if already unbanned
+    if not row["banned"]:
         conn.close()
-        return jsonify({"error": "already unbanned"}), 404
+        return json_error("already unbanned")
 
-    # only update if checks are negative
-    c.execute("UPDATE users SET banned=FALSE WHERE license_key=%s", (key,))
+    c.execute("""
+        UPDATE users
+        SET banned=FALSE
+        WHERE license_key=%s AND admin_id=%s
+    """, (key, g.admin_id))
+
     conn.commit()
     conn.close()
 
@@ -263,7 +351,8 @@ def unban():
 # EXTEND
 # =========================
 @app.route("/extend", methods=["POST"])
-@protected
+@token_required
+@roles_required("admin", "moderator")
 def extend():
     data = request.get_json() or {}
 
@@ -274,21 +363,25 @@ def extend():
     except:
         return json_error("invalid days")
 
-    # checks for 0 or negative days
     if days <= 0:
         return json_error("days must not be 0 or negative")
 
     conn = db()
     c = conn.cursor(cursor_factory=RealDictCursor)
 
-    c.execute("SELECT expires, banned FROM users WHERE license_key=%s", (key,))
+    # ✅ get current user FIRST
+    c.execute("""
+        SELECT expires, banned 
+        FROM users
+        WHERE license_key=%s AND admin_id=%s
+    """, (key, g.admin_id))
+
     row = c.fetchone()
 
     if not row:
         conn.close()
-        return json_error("not found or missing key")
+        return json_error("not found or not yours")
 
-    # check for blocked users
     if row["banned"]:
         conn.close()
         return json_error("cannot extend banned account")
@@ -298,49 +391,60 @@ def extend():
     c.execute("""
         UPDATE users
         SET expires=%s
-        WHERE license_key=%s
-    """, (new_exp, key))
+        WHERE license_key=%s AND admin_id=%s
+    """, (new_exp, key, g.admin_id))
 
     conn.commit()
     conn.close()
 
-    return jsonify({"message": "extended"})
+    return jsonify({
+        "message": "extended",
+        "new_expiry": new_exp.isoformat()
+    })
 
 # =========================
 # DELETE
 # =========================
 @app.route("/delete", methods=["POST"])
-@protected
+@token_required
+@roles_required("admin", "moderator")
 def delete():
     data = request.get_json() or {}
     key = data.get("license_key")
 
     if not key:
-        return jsonify({"error": "Put a key first"}), 400
+        return json_error("license_key required")
 
     conn = db()
     c = conn.cursor()
 
-    c.execute("DELETE FROM users WHERE license_key=%s", (key,))
+    c.execute("""
+        DELETE FROM users
+        WHERE license_key=%s AND admin_id=%s
+    """, (key, g.admin_id))
     conn.commit()
 
     if c.rowcount == 0:
         conn.close()
-        return jsonify({"message": "key not found or has been deleted"}), 404
-    conn.close()
+        return jsonify({"message": "key not found"}), 404
 
+    conn.close()
     return jsonify({"message": "successfully deleted"}), 200
 
 # =========================
 # STATS
 # =========================
 @app.route("/stats", methods=["GET"])
-@protected
+@token_required
+@roles_required("admin", "moderator")
 def stats():
     conn = db()
     c = conn.cursor(cursor_factory=RealDictCursor)
 
-    c.execute("SELECT * FROM users")
+    c.execute("""
+        SELECT * FROM users
+        WHERE admin_id = %s
+    """, (g.admin_id,))
     users = c.fetchall()
     conn.close()
 
@@ -368,12 +472,16 @@ def stats():
 # USERS
 # =========================
 @app.route("/users", methods=["GET"])
-@protected
+@token_required
+@roles_required("admin", "moderator")
 def users():
     conn = db()
     c = conn.cursor(cursor_factory=RealDictCursor)
 
-    c.execute("SELECT * FROM users")
+    c.execute("""
+        SELECT * FROM users
+        WHERE admin_id = %s
+    """, (g.admin_id,))
     rows = c.fetchall()
     conn.close()
 
@@ -399,5 +507,3 @@ def users():
 # =========================
 if __name__ == "__main__":
     app.run(debug=True)
-
-    #KALBO
